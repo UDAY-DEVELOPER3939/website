@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lyrics Sync</title>
+  <style>
+    :root { --bg:#0b0b0f; --inactive:rgba(255,255,255,.12); --white:#fff; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,sans-serif; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; overflow:hidden; color:var(--white); background:var(--bg); }
+    .ambient-bg { position:fixed; inset:0; z-index:-1; opacity:.85; filter:blur(60px); transform:scale(1.1); background:radial-gradient(circle at 30% 20%,#40180d 0,transparent 40%),radial-gradient(circle at 80% 40%,#592512 0,transparent 50%),radial-gradient(circle at 40% 80%,#1f0d3d 0,transparent 60%),#150906; }
+    .app { height:100vh; display:flex; flex-direction:column; align-items:center; }
+    .sources { width:min(88%,640px); display:flex; flex-wrap:wrap; gap:9px; align-items:center; margin:20px 0 0; font-size:14px; color:rgba(255,255,255,.7); }
+    .sources label, .sources input[type=url], button { border:1px solid rgba(255,255,255,.18); border-radius:999px; padding:9px 13px; color:var(--white); background:rgba(0,0,0,.18); font:inherit; }
+    .sources label, button { cursor:pointer; } .sources label:hover, button:hover { background:rgba(255,255,255,.1); }
+    .sources input[type=file] { display:none; }.sources input[type=url] { min-width:175px; flex:1 1 190px; outline:none; }.sources input::placeholder { color:rgba(255,255,255,.45); }
+    #status { flex:1 1 100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .lyrics-container { width:88%; max-width:640px; flex:1; min-height:0; overflow-y:auto; scroll-behavior:smooth; scrollbar-width:none; }.lyrics-container::-webkit-scrollbar { display:none; }.lyrics-padding { padding:30vh 0 45vh; }
+    .empty { color:rgba(255,255,255,.5); font-size:20px; text-align:center; }.lyric-line { width:100%; margin:44px 0; cursor:pointer; font-size:38px; font-weight:800; letter-spacing:-.5px; line-height:1.4; opacity:.2; transform-origin:left center; transition:transform .4s cubic-bezier(.25,1,.5,1),opacity .4s ease; }.lyric-line.past { opacity:.4; transform:scale(.96); }.lyric-line.active { opacity:1; transform:scale(1.04); }
+    .word-group { display:inline-flex; margin-right:12px; white-space:nowrap; vertical-align:bottom; }.word { position:relative; display:inline-block; color:var(--inactive); }.word::before { content:attr(data-text); position:absolute; inset:0 auto 0 0; width:var(--progress,0%); overflow:hidden; color:var(--white); white-space:nowrap; transition:width var(--duration,0s) linear; }
+    .player { width:100%; padding:18px 0 26px; display:flex; justify-content:center; border-top:1px solid rgba(255,255,255,.05); background:rgba(15,7,5,.3); backdrop-filter:blur(40px); } audio { width:min(82%,540px); filter:invert(.9) hue-rotate(180deg); }
+    @media (max-width:768px) { .sources,.lyrics-container { width:95%; }.sources { margin-top:12px; }.lyrics-padding { padding:24vh 0 35vh; }.lyric-line { margin:20px 0; font-size:28px; }.lyric-line.active { transform:scale(1.02); }.lyric-line.past { transform:scale(.98); } }
+  </style>
+</head>
+<body>
+  <div class="ambient-bg"></div>
+  <main class="app">
+    <section class="sources" aria-label="Song and lyrics sources">
+      <label>Choose song <input id="audioFile" type="file" accept="audio/*"></label>
+      <label>Choose lyrics <input id="lyricsFile" type="file" accept=".json,.lrc,application/json,text/plain"></label>
+      <input id="audioUrl" type="url" inputmode="url" placeholder="Paste song URL" aria-label="Song URL">
+      <input id="lyricsUrl" type="url" inputmode="url" placeholder="Paste LRC, JSON, or LRCLIB URL" aria-label="Lyrics URL">
+      <button id="loadUrls" type="button">Load URLs</button>
+      <span id="status">Mix sources freely: choose either item locally and/or paste a direct URL for the other.</span>
+    </section>
+    <div class="lyrics-container" id="lyricsContainer"><div class="lyrics-padding" id="lyricsWrapper"><p class="empty">Your synced lyrics will appear here.</p></div></div>
+    <div class="player"><audio id="audioTrack" controls></audio></div>
+  </main>
+  <script>
+    let timeline = [];
+    const audio = document.getElementById('audioTrack');
+    const wrapper = document.getElementById('lyricsWrapper');
+    const container = document.getElementById('lyricsContainer');
+    const status = document.getElementById('status');
+
+    function parseJson(data) {
+      if (!Array.isArray(data)) throw new Error('JSON must be an array of lyric lines.');
+      return data.map(line => {
+        if (!Array.isArray(line.words) || !line.words.length) throw new Error('Each line requires a words array.');
+        const words = line.words.map(word => ({ text:String(word.text ?? ''), start:Number(word.start), dur:Number(word.dur) }));
+        if (words.some(word => !Number.isFinite(word.start) || !Number.isFinite(word.dur) || word.dur <= 0)) throw new Error('Each word needs numeric start and positive dur values (in milliseconds).');
+        return { words };
+      });
+    }
+    function parseLrc(text) {
+      const lines = [];
+      text.split(/\r?\n/).forEach(raw => {
+        const lyric = raw.replace(/\[\d+:\d+(?:\.\d+)?\]/g, '').trim();
+        [...raw.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)].forEach(match => lyric && lines.push({ start:(Number(match[1]) * 60 + Number(match[2])) * 1000, lyric }));
+      });
+      lines.sort((a,b) => a.start - b.start);
+      return lines.map((line,index) => {
+        const words = line.lyric.split(/\s+/), next = lines[index + 1]?.start ?? line.start + 3000, duration = Math.max(250,(next-line.start)/words.length);
+        return { words:words.map((text,i) => ({ text, start:line.start+i*duration, dur:duration })) };
+      });
+    }
+    function loadLyrics(content, name) {
+      try {
+        if (name.toLowerCase().split('?')[0].endsWith('.lrc')) timeline = parseLrc(content);
+        else {
+          const data = JSON.parse(content);
+          // LRCLIB returns synced lyrics as an LRC string inside its JSON response.
+          timeline = typeof data.syncedLyrics === 'string' ? parseLrc(data.syncedLyrics) : parseJson(data);
+        }
+        if (!timeline.length) throw new Error('No timed lyric lines found.');
+        build(); status.textContent = `Lyrics: ${name}`;
+      } catch (error) { timeline = []; build(); status.textContent = `Could not load lyrics: ${error.message}`; }
+    }
+    function build() {
+      wrapper.innerHTML = '';
+      if (!timeline.length) { wrapper.innerHTML = '<p class="empty">Your synced lyrics will appear here.</p>'; return; }
+      timeline.forEach((line,li) => {
+        const row = document.createElement('div'); row.id=`line-${li}`; row.className='lyric-line';
+        line.words.forEach((word,wi) => { const group=document.createElement('span'), node=document.createElement('span'); group.className='word-group'; node.className='word'; node.id=`word-${li}-${wi}`; node.dataset.text=word.text; node.textContent=word.text; group.append(node); row.append(group); });
+        row.addEventListener('click',()=>{ audio.currentTime=line.words[0].start/1000; }); wrapper.append(row);
+      });
+      sync();
+    }
+    function setProgress(node, progress, duration=0) { node.style.setProperty('--progress',`${progress}%`); node.style.setProperty('--duration',`${duration}s`); }
+    function sync() {
+      const now = audio.currentTime * 1000;
+      timeline.forEach((line,li) => {
+        const row=document.getElementById(`line-${li}`), start=line.words[0].start, last=line.words.at(-1), end=last.start+last.dur;
+        if (!row) return; row.className=`lyric-line${now>=end?' past':now>=start?' active':''}`;
+        line.words.forEach((word,wi) => { const node=document.getElementById(`word-${li}-${wi}`); if (!node) return; if(now>=word.start+word.dur) setProgress(node,100); else if(now>=word.start) { const progress=(now-word.start)/word.dur*100, remaining=(word.dur-(now-word.start))/1000; setProgress(node,audio.paused?progress:100,audio.paused?0:remaining); } else { node.style.removeProperty('--progress'); node.style.removeProperty('--duration'); } });
+        if(now>=start&&now<end) container.scrollTop=row.offsetTop-container.clientHeight/2+row.clientHeight/2;
+      });
+    }
+    function setAudio(source, name) {
+      if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
+      audio.src=source; audio.load(); document.title=`${name} — Lyrics Sync`; status.textContent=`Song: ${name}`;
+    }
+    document.getElementById('audioFile').addEventListener('change',event=>{ const file=event.target.files[0]; if(file) setAudio(URL.createObjectURL(file),file.name); });
+    document.getElementById('lyricsFile').addEventListener('change',async event=>{ const file=event.target.files[0]; if(file) loadLyrics(await file.text(),file.name); });
+    document.getElementById('loadUrls').addEventListener('click',async()=>{
+      const songUrl=document.getElementById('audioUrl').value.trim(), lyricUrl=document.getElementById('lyricsUrl').value.trim();
+      if(!songUrl&&!lyricUrl) { status.textContent='Paste a song URL, lyrics URL, or both.'; return; }
+      try { if(songUrl) { new URL(songUrl); setAudio(songUrl,'Online song URL'); } if(lyricUrl) { new URL(lyricUrl); status.textContent='Loading lyrics URL…'; const response=await fetch(lyricUrl); if(!response.ok) throw new Error(`Request failed (${response.status})`); loadLyrics(await response.text(),lyricUrl); } } catch(error) { status.textContent=`Could not load URL: ${error.message}`; }
+    });
+    audio.addEventListener('error', () => {
+      if (audio.currentSrc.startsWith('http')) status.textContent='That song URL is not a playable public audio file. Use a direct MP3/M4A/OGG URL or an authorized music-provider integration.';
+    });
+    ['timeupdate','pause','play','seeked'].forEach(event=>audio.addEventListener(event,sync));
+  </script>
+</body>
+</html>
